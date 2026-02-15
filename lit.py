@@ -590,7 +590,6 @@ def compute_analysis_table(
 
 
 
-
     # Calculate RVOL
     data["rvol"] = data.groupby("trading_date")["Volume"].transform(
     lambda s: calculate_relative_volume(s, window=rvol_window)
@@ -691,6 +690,8 @@ def create_mike_chart(data: pd.DataFrame, ticker: str) -> go.Figure:
         title=dict(
             text=f"{ticker} - Mike (Basis Points from Previous Close)",
             font=dict(size=20, color="#1f77b4"),
+            plot_bgcolor="rgba(0,0,0,0)",   # inside the axes
+    paper_bgcolor="rgba(0,0,0,0)",  # around the axes (the “page”)
         ),
         xaxis=dict(
             title="Time (New York)",
