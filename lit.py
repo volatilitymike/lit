@@ -1,363 +1,669 @@
-# app.py
-from __future__ import annotations
+"""
+VOLMIKE.COM - Financial Analysis Dashboard
+Production-ready Streamlit application for market analysis and visualization
+"""
 
-import json
-import re
-from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional
-
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import yfinance as yf
+from datetime import date, timedelta, datetime
+from typing import List, Dict, Tuple, Optional
+import base64
+import json
+import logging
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-st.set_page_config(
-    page_title="VolMike Minimal — yfinance (Table)",
-    page_icon="📦",
-    layout="centered",
-)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-NY_TZ = "America/New_York"
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-INTERVAL_MAP = {
-    "2m": "2m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "60m": "60m",
-}
+DEFAULT_TICKERS = [
+    "ES=F", "NQ=F", "YM=F", "SPY", "VIXY", "SOXX", "NVDA", "AMZN", "MU",
+    "AMD", "QCOM", "SMCI", "MSFT", "UBER", "AVGO", "MRVL", "QQQ", "PLTR",
+    "AAPL", "GOOGL", "META", "XLY", "TSLA", "NKE", "GM", "C", "DKNG",
+    "CHWY", "ETSY", "CART", "W", "KBE", "WFC", "HOOD", "PYPL", "COIN",
+    "BAC", "JPM", "BTC-USD", "ETH-USD", "XRP-USD", "ADA-USD", "SOL-USD",
+    "DOGE-USD", "MES=F", "MYM=F", "M6E=F", "MGC=F", "MNQ=F", "GC=F", "CL=F"
+]
 
-RTH_START = time(9, 30)
-RTH_END = time(16, 0)  # treated as exclusive end
+TIMEFRAME_OPTIONS = ["2m", "5m", "15m", "30m", "60m", "1d"]
 
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
-# -----------------------------
-# MODELS
-# -----------------------------
-@dataclass(frozen=True)
-class RowOut:
-    time_ny: str
-    price: float
-    mike: Optional[float]
-    rvol: Optional[float]
-
-
-# -----------------------------
-# HELPERS
-# -----------------------------
-_TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,12}$")
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _to_float(x: object) -> Optional[float]:
+def safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Safely divide two numbers, returning default if denominator is zero."""
     try:
-        v = float(x)
-        return v if np.isfinite(v) else None
-    except Exception:
-        return None
+        return numerator / denominator if denominator != 0 else default
+    except (TypeError, ZeroDivisionError):
+        return default
 
 
-def _validate_ticker(t: str) -> str:
-    t2 = (t or "").upper().strip()
-    if not t2 or not _TICKER_RE.match(t2):
-        raise ValueError("Invalid ticker. Use letters/numbers plus . or - (no spaces).")
-    return t2
-
-
-def compute_mike(price: float, prev_close: float) -> float:
-    if prev_close <= 0 or not np.isfinite(prev_close):
-        raise ValueError("prev_close must be a finite number > 0")
-    return (price / prev_close) * 10_000.0
-
-
-def compute_rvol_series(volume: pd.Series, window: int = 20) -> pd.Series:
-    w = int(max(1, window))
-    v = pd.to_numeric(volume, errors="coerce").astype(float)
-    base = v.rolling(window=w, min_periods=max(1, w // 2)).mean()
-    r = v / base
-    return r.replace([np.inf, -np.inf], np.nan)
-
-
-def _ensure_utc(ts: pd.Series) -> pd.Series:
-    s = pd.to_datetime(ts, errors="coerce")
-    # If tz-naive, treat as UTC. If tz-aware, convert to UTC.
-    if getattr(s.dt, "tz", None) is None:
-        return s.dt.tz_localize("UTC")
-    return s.dt.tz_convert("UTC")
-
-
-def normalize_yf_intraday(df: pd.DataFrame) -> pd.DataFrame:
+def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize yfinance intraday output into columns:
-      time (UTC tz-aware), Close, Volume
+    Normalize column names for consistency.
+    - Lowercase
+    - Replace spaces with underscores
+    - Remove special characters
     """
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    d = df.copy()
-
-    # Flatten MultiIndex columns if present
-    if isinstance(d.columns, pd.MultiIndex):
-        d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
-
-    d = d.reset_index()
-
-    time_col = None
-    for c in ("Datetime", "Date", "index"):
-        if c in d.columns:
-            time_col = c
-            break
-    if time_col is None:
-        return pd.DataFrame()
-
-    d = d.rename(columns={time_col: "time"})
-    d["time"] = _ensure_utc(d["time"])
-    d["Close"] = pd.to_numeric(d.get("Close"), errors="coerce")
-    d["Volume"] = pd.to_numeric(d.get("Volume"), errors="coerce")
-
-    d = d.dropna(subset=["time", "Close"]).sort_values("time").reset_index(drop=True)
-    return d
-
-
-def fetch_intraday(ticker: str, start_d: date, end_d: date, interval: str) -> pd.DataFrame:
-    """
-    Fetch intraday bars from start_d through end_d (inclusive).
-    yfinance end is typically exclusive -> we add +1 day.
-    """
-    start = datetime.combine(start_d, datetime.min.time())
-    end_exclusive = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
-
-    raw = yf.download(
-        tickers=ticker,
-        start=start,
-        end=end_exclusive,
-        interval=interval,
-        auto_adjust=False,
-        prepost=False,
-        progress=False,
-        threads=False,
+    df = df.copy()
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[ $()]", "", regex=True)
+        .str.replace(" ", "_", regex=True)
     )
-    return normalize_yf_intraday(raw)
+    return df
 
 
-def fetch_daily_with_backfill(ticker: str, start_d: date, end_d: date) -> pd.DataFrame:
-    """
-    Fetch daily bars with backfill so we can always find previous trading-day close.
-    """
-    backfill_start = start_d - timedelta(days=45)
-    start = datetime.combine(backfill_start, datetime.min.time())
-    end_exclusive = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
-
-    raw = yf.download(
-        tickers=ticker,
-        start=start,
-        end=end_exclusive,
-        interval="1d",
-        auto_adjust=False,
-        prepost=False,
-        progress=False,
-        threads=False,
-    )
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-
-    d = raw.copy()
-    if isinstance(d.columns, pd.MultiIndex):
-        d.columns = [c[0] if isinstance(c, tuple) else c for c in d.columns]
-
-    d = d.dropna(subset=["Close"]).copy()
-    return d
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Convert DataFrame to CSV bytes for download."""
+    df = clean_column_names(df)
+    return df.to_csv(index=False).encode("utf-8")
 
 
-def build_prev_close_lookup(daily: pd.DataFrame) -> tuple[list[date], list[float]]:
-    """
-    Build sorted trading dates and their closes.
-    We treat daily index labels as the trading date.
-    """
-    if daily is None or daily.empty or "Close" not in daily.columns:
-        raise ValueError("Daily data missing/invalid (needed for prev close).")
+# =============================================================================
+# DATA FETCHING
+# =============================================================================
 
-    idx = pd.to_datetime(daily.index, errors="coerce")
-    if idx.isna().all():
-        raise ValueError("Daily index is not parseable.")
-
-    d = pd.DataFrame(
-        {
-            "d": idx.date,
-            "close": pd.to_numeric(daily["Close"], errors="coerce").astype(float),
-        }
-    ).dropna(subset=["d", "close"])
-
-    d = d.drop_duplicates(subset=["d"]).sort_values("d")
-    dates = d["d"].tolist()
-    closes = d["close"].tolist()
-    if len(dates) < 2:
-        raise ValueError("Not enough daily history to compute prev close.")
-    return dates, closes
-
-
-def prev_close_for_day(trading_dates: list[date], closes: list[float], day: date) -> Optional[float]:
-    """
-    For intraday trading date = day, return previous trading day's close.
-    If day isn't in daily list (e.g., yfinance didn't include it yet), still return last close before day.
-    """
-    # Find insertion point for 'day' in trading_dates (sorted)
-    pos = int(np.searchsorted(np.array(trading_dates, dtype="O"), day, side="left"))
-
-    # If day is exactly a trading date in the list, prev is pos-1
-    if pos < len(trading_dates) and trading_dates[pos] == day:
-        if pos - 1 >= 0:
-            return float(closes[pos - 1])
-        return None
-
-    # Otherwise, day isn't present; prev is the last date strictly before day -> pos-1
-    if pos - 1 >= 0:
-        return float(closes[pos - 1])
-    return None
-
-
-def filter_rth_ny(intraday: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert intraday UTC times to NY times and filter to RTH 09:30 <= t < 16:00 (NY).
-    """
-    if intraday is None or intraday.empty:
-        return pd.DataFrame()
-
-    d = intraday.copy()
-    d["time_ny"] = d["time"].dt.tz_convert(NY_TZ)
-    t = d["time_ny"].dt.time
-    mask = (t >= RTH_START) & (t < RTH_END)
-    d = d.loc[mask].sort_values("time_ny").reset_index(drop=True)
-    return d
-
-
-def compute_table(
+@st.cache_data(ttl=300)
+def fetch_daily_data(
     ticker: str,
-    intraday_rth: pd.DataFrame,
-    daily: pd.DataFrame,
-    rvol_window: int = 20,
-) -> pd.DataFrame:
-    if intraday_rth is None or intraday_rth.empty:
-        raise ValueError("No RTH intraday bars returned. Try a wider date range or different interval.")
+    end_date: date
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Fetch previous day's OHLC data.
+    
+    Returns:
+        Tuple of (prev_close, prev_high, prev_low)
+    """
+    try:
+        daily_data = yf.download(
+            ticker,
+            end=end_date,
+            interval="1d",
+            progress=False,
+            threads=False
+        )
+        
+        if daily_data.empty:
+            return None, None, None
+            
+        # Handle multi-index columns
+        if isinstance(daily_data.columns, pd.MultiIndex):
+            daily_data.columns = daily_data.columns.map(
+                lambda x: x[0] if isinstance(x, tuple) else x
+            )
+        
+        prev_close = float(daily_data["Close"].iloc[-1])
+        prev_high = float(daily_data["High"].iloc[-1])
+        prev_low = float(daily_data["Low"].iloc[-1])
+        
+        return prev_close, prev_high, prev_low
+        
+    except Exception as e:
+        logger.error(f"Error fetching daily data for {ticker}: {e}")
+        return None, None, None
 
-    trading_dates, closes = build_prev_close_lookup(daily)
 
-    d = intraday_rth.copy()
-    d["day_ny"] = d["time_ny"].dt.date
-
-    # prev close per NY trading day
-    d["prev_close"] = d["day_ny"].map(lambda day: prev_close_for_day(trading_dates, closes, day))
-
-    # mike
-    def _mike_row(row: pd.Series) -> Optional[float]:
-        px = _to_float(row.get("Close"))
-        pc = _to_float(row.get("prev_close"))
-        if px is None or pc is None or pc <= 0:
+@st.cache_data(ttl=300)
+def fetch_intraday_data(
+    ticker: str,
+    start_date: date,
+    end_date: date,
+    timeframe: str
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch intraday data for the specified ticker and timeframe.
+    
+    Returns:
+        DataFrame with intraday data or None if fetch fails
+    """
+    try:
+        intraday = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            interval=timeframe,
+            progress=False
+        )
+        
+        if intraday.empty:
             return None
-        return float((px / pc) * 10_000.0)
-
-    d["mike"] = d.apply(_mike_row, axis=1)
-
-    # rvol
-    rvol_s = compute_rvol_series(d["Volume"], window=rvol_window)
-    d["rvol"] = pd.to_numeric(rvol_s, errors="coerce").astype(float).replace([np.inf, -np.inf], np.nan)
-
-    out = pd.DataFrame(
-        {
-            "time": d["time_ny"].dt.strftime("%Y-%m-%d %H:%M"),
-            "price": pd.to_numeric(d["Close"], errors="coerce").astype(float),
-            "mike": pd.to_numeric(d["mike"], errors="coerce").astype(float),
-            "rvol": pd.to_numeric(d["rvol"], errors="coerce").astype(float),
-        }
-    )
-
-    # Clean
-    out = out.dropna(subset=["time", "price"]).reset_index(drop=True)
-    return out
-
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("📦 VolMike Minimal (yfinance) — RTH Table")
-st.caption("RTH table (New York time): time, price, Mike (vs prev close), RVOL (20-bar). JSON download only.")
-
-ticker_in = st.text_input("ticker", value="SPY")
-
-col1, col2 = st.columns(2)
-with col1:
-    start_d = st.date_input("date start", value=date.today() - timedelta(days=5))
-with col2:
-    end_d = st.date_input("date end", value=date.today())
-
-interval_choice = st.selectbox("minutes", ["2m", "5m", "15m", "30m", "60m"], index=1)
-
-run = st.button("run", type="primary")
-
-if run:
-    try:
-        ticker = _validate_ticker(ticker_in)
-        if start_d > end_d:
-            raise ValueError("Start date must be <= end date.")
-        interval = INTERVAL_MAP[interval_choice]
+        
+        intraday.reset_index(inplace=True)
+        
+        # Handle multi-index columns
+        if isinstance(intraday.columns, pd.MultiIndex):
+            intraday.columns = intraday.columns.map(
+                lambda x: x[0] if isinstance(x, tuple) else x
+            )
+        
+        # Standardize datetime column name
+        if "Datetime" in intraday.columns:
+            intraday.rename(columns={"Datetime": "Date"}, inplace=True)
+        
+        # Convert to New York time
+        if intraday["Date"].dtype == "datetime64[ns]":
+            intraday["Date"] = (
+                intraday["Date"]
+                .dt.tz_localize("UTC")
+                .dt.tz_convert("America/New_York")
+            )
+        else:
+            intraday["Date"] = (
+                intraday["Date"]
+                .dt.tz_convert("America/New_York")
+            )
+        
+        intraday["Date"] = intraday["Date"].dt.tz_localize(None)
+        
+        # Add Time column (12-hour format)
+        intraday["Time"] = intraday["Date"].dt.strftime("%I:%M %p")
+        
+        # Keep only date in Date column
+        intraday["Date"] = intraday["Date"].dt.strftime("%Y-%m-%d")
+        
+        # Add Range column
+        intraday["Range"] = intraday["High"] - intraday["Low"]
+        
+        return intraday
+        
     except Exception as e:
-        st.error(str(e))
-        st.stop()
+        logger.error(f"Error fetching intraday data for {ticker}: {e}")
+        return None
 
-    with st.spinner("Fetching from yfinance…"):
-        intraday = fetch_intraday(ticker, start_d, end_d, interval)
-        daily = fetch_daily_with_backfill(ticker, start_d, end_d)
 
-    if intraday.empty:
-        st.error("No intraday data returned. Try a wider date range or a different ticker/interval.")
-        st.stop()
+# =============================================================================
+# TECHNICAL INDICATORS
+# =============================================================================
 
-    if daily.empty:
-        st.error("No daily data returned (needed for prev close). Try again.")
-        st.stop()
+def calculate_f_percentage(
+    df: pd.DataFrame,
+    prev_close: float,
+    col_name: str = "F_numeric"
+) -> pd.DataFrame:
+    """
+    Calculate F% (percentage change from previous close in basis points).
+    
+    Args:
+        df: DataFrame with Close prices
+        prev_close: Previous day's closing price
+        col_name: Name for the output column
+        
+    Returns:
+        DataFrame with F% column added
+    """
+    df = df.copy()
+    if prev_close and prev_close != 0:
+        df[col_name] = ((df["Close"] - prev_close) / prev_close) * 10000
+        df["F%"] = df[col_name].round(0).astype(int).astype(str) + "%"
+    else:
+        df[col_name] = 0
+        df["F%"] = "N/A"
+    return df
 
-    intraday_rth = filter_rth_ny(intraday)
 
-    try:
-        table = compute_table(ticker, intraday_rth, daily, rvol_window=20)
-    except Exception as e:
-        st.error(f"Compute error: {e}")
-        st.stop()
+def calculate_rvol(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    """
+    Calculate Relative Volume (RVOL).
+    
+    Args:
+        df: DataFrame with Volume column
+        window: Rolling window size
+        
+    Returns:
+        DataFrame with RVOL_5 column added
+    """
+    df = df.copy()
+    if len(df) >= window and "Volume" in df.columns:
+        avg_vol = df["Volume"].rolling(window=window).mean()
+        df["RVOL_5"] = safe_div(df["Volume"], avg_vol, default=np.nan)
+    else:
+        df["RVOL_5"] = np.nan
+    return df
 
-    if table.empty:
-        st.error("No RTH rows found for that range. Try different dates/interval.")
-        st.stop()
 
-    st.subheader("RTH table")
-    st.dataframe(
-        table,
-        use_container_width=True,
-        hide_index=True,
+def calculate_bollinger_bands(
+    df: pd.DataFrame,
+    price_col: str = "F_numeric",
+    window: int = 20,
+    num_std: float = 2.0
+) -> pd.DataFrame:
+    """
+    Calculate Bollinger Bands for F%.
+    
+    Args:
+        df: DataFrame with price data
+        price_col: Column to calculate bands for
+        window: Rolling window size
+        num_std: Number of standard deviations
+        
+    Returns:
+        DataFrame with Bollinger Band columns added
+    """
+    df = df.copy()
+    if price_col in df.columns:
+        df["F% MA"] = df[price_col].rolling(window=window, min_periods=1).mean()
+        df["F% Std"] = df[price_col].rolling(window=window, min_periods=1).std()
+        df["F% Upper"] = df["F% MA"] + (num_std * df["F% Std"])
+        df["F% Lower"] = df["F% MA"] - (num_std * df["F% Std"])
+    return df
+
+
+def calculate_ichimoku(
+    df: pd.DataFrame,
+    prev_close: float,
+    tenkan_period: int = 9,
+    kijun_period: int = 26
+) -> pd.DataFrame:
+    """
+    Calculate Ichimoku Cloud indicators in F% space.
+    
+    Args:
+        df: DataFrame with OHLC data
+        prev_close: Previous day's close for F% conversion
+        tenkan_period: Tenkan-sen period
+        kijun_period: Kijun-sen period
+        
+    Returns:
+        DataFrame with Ichimoku indicators added
+    """
+    df = df.copy()
+    
+    # Tenkan-sen (Conversion Line)
+    tenkan_high = df["High"].rolling(window=tenkan_period, min_periods=1).max()
+    tenkan_low = df["Low"].rolling(window=tenkan_period, min_periods=1).min()
+    df["Tenkan_sen"] = (tenkan_high + tenkan_low) / 2
+    
+    # Kijun-sen (Base Line)
+    kijun_high = df["High"].rolling(window=kijun_period, min_periods=1).max()
+    kijun_low = df["Low"].rolling(window=kijun_period, min_periods=1).min()
+    df["Kijun_sen"] = (kijun_high + kijun_low) / 2
+    
+    # Convert to F% scale
+    if prev_close and prev_close != 0:
+        df["Tenkan_F"] = ((df["Tenkan_sen"] - prev_close) / prev_close) * 10000
+        df["Kijun_F"] = ((df["Kijun_sen"] - prev_close) / prev_close) * 10000
+    else:
+        df["Tenkan_F"] = 0
+        df["Kijun_F"] = 0
+    
+    return df
+
+
+# =============================================================================
+# MARKET PROFILE
+# =============================================================================
+
+def compute_value_area(
+    df: pd.DataFrame,
+    price_col: str = "F_numeric",
+    target_bins: int = 20,
+    min_bin_width: float = 0.5
+) -> Tuple[float, float, pd.DataFrame]:
+    """
+    Compute Market Profile Value Area.
+    
+    Args:
+        df: DataFrame with price and time data
+        price_col: Column containing price data
+        target_bins: Target number of price bins
+        min_bin_width: Minimum bin width
+        
+    Returns:
+        Tuple of (va_min, va_max, profile_df)
+    """
+    import string
+    
+    if price_col not in df.columns:
+        raise ValueError(f"Column {price_col} not found in DataFrame")
+    
+    # Create price bins
+    lo, hi = df[price_col].min(), df[price_col].max()
+    price_range = max(hi - lo, 1e-6)
+    step = max(price_range / target_bins, min_bin_width)
+    f_bins = np.arange(lo - step, hi + step, step)
+    
+    df = df.copy()
+    df["F_Bin"] = pd.cut(
+        df[price_col],
+        bins=f_bins,
+        labels=[str(x) for x in f_bins[:-1]]
     )
+    
+    # Letter assignment (15-min intervals)
+    if "Time" in df.columns:
+        df = df[df["Time"].notna()]
+        df["TimeIndex"] = pd.to_datetime(
+            df["Time"],
+            format="%I:%M %p",
+            errors="coerce"
+        )
+        df = df[df["TimeIndex"].notna()]
+        df["LetterIndex"] = (
+            (df["TimeIndex"].dt.hour * 60 + df["TimeIndex"].dt.minute") // 15
+        ).astype(int)
+        df["LetterIndex"] -= df["LetterIndex"].min()
+        
+        letters = string.ascii_uppercase
+        df["Letter"] = df["LetterIndex"].apply(
+            lambda n: letters[n] if n < 26
+            else letters[(n // 26) - 1] + letters[n % 26]
+        )
+    else:
+        df["Letter"] = "X"
+    
+    # Build Market Profile
+    profile = {}
+    for b in f_bins[:-1]:
+        key = str(b)
+        lets = df.loc[df["F_Bin"] == key, "Letter"].dropna().unique()
+        if len(lets):
+            profile[key] = "".join(sorted(lets))
+    
+    profile_df = pd.DataFrame(
+        profile.items(),
+        columns=["F% Level", "Letters"]
+    ).astype({"F% Level": float})
+    profile_df["Letter_Count"] = profile_df["Letters"].str.len().fillna(0)
+    
+    # Calculate 70% Value Area
+    total = profile_df["Letter_Count"].sum()
+    target = total * 0.7
+    poc_sorted = profile_df.sort_values("Letter_Count", ascending=False)
+    
+    cumulative = 0
+    va_levels = []
+    for _, row in poc_sorted.iterrows():
+        cumulative += row["Letter_Count"]
+        va_levels.append(row["F% Level"])
+        if cumulative >= target:
+            break
+    
+    va_min = min(va_levels) if va_levels else 0
+    va_max = max(va_levels) if va_levels else 0
+    
+    return va_min, va_max, profile_df
 
-    # JSON download (NOT visible)
-    payload = {
-        "ticker": ticker,
-        "start_date": str(start_d),
-        "end_date": str(end_d),
-        "interval": interval_choice,
-        "timezone": NY_TZ,
-        "rvol_window": 20,
-        "computed_at_utc": _now_utc_iso(),
-        "rows": table.to_dict(orient="records"),
-    }
-    json_bytes = json.dumps(payload, indent=2).encode("utf-8")
 
-    st.download_button(
-        "download json",
-        data=json_bytes,
-        file_name=f"{ticker}_mike_rvol_table_{start_d}_{end_d}_{interval_choice}.json",
-        mime="application/json",
+# =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def create_f_percent_plot(
+    df: pd.DataFrame,
+    prev_close: float,
+    prev_high: float,
+    prev_low: float,
+    ticker: str
+) -> go.Figure:
+    """
+    Create main F% visualization plot.
+    
+    Args:
+        df: DataFrame with processed indicators
+        prev_close: Previous day's close
+        prev_high: Previous day's high
+        prev_low: Previous day's low
+        ticker: Ticker symbol
+        
+    Returns:
+        Plotly figure object
+    """
+    fig = make_subplots(
+        rows=1,
+        cols=1,
+        vertical_spacing=0.03,
+        shared_xaxes=True
     )
+    
+    # Main F% line
+    scatter_f = go.Scatter(
+        x=df["Time"],
+        y=df["F_numeric"],
+        mode="lines+markers",
+        customdata=df["Close"],
+        line=dict(color="#57c7ff", width=1),
+        hovertemplate="Time: %{x}<br>F%: %{y:.2f}<br>Close: $%{customdata:.2f}<extra></extra>",
+        name="F%"
+    )
+    fig.add_trace(scatter_f, row=1, col=1)
+    
+    # Zero line
+    fig.add_hline(
+        y=0,
+        line_dash="dash",
+        row=1, col=1,
+        annotation_text="0%",
+        annotation_position="top left"
+    )
+    
+    # Bollinger Bands
+    if all(col in df.columns for col in ["F% Upper", "F% Lower", "F% MA"]):
+        fig.add_trace(go.Scatter(
+            x=df["Time"],
+            y=df["F% Upper"],
+            mode="lines",
+            line=dict(dash="solid", color="#d3d3d3", width=1),
+            name="Upper Band"
+        ), row=1, col=1)
+        
+        fig.add_trace(go.Scatter(
+            x=df["Time"],
+            y=df["F% Lower"],
+            mode="lines",
+            line=dict(dash="solid", color="#d3d3d3", width=1),
+            name="Lower Band"
+        ), row=1, col=1)
+        
+        fig.add_trace(go.Scatter(
+            x=df["Time"],
+            y=df["F% MA"],
+            mode="lines",
+            line=dict(dash="dash", color="#d3d3d3", width=2),
+            name="Middle Band"
+        ), row=1, col=1)
+    
+    # Ichimoku lines
+    if "Kijun_F" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["Time"],
+            y=df["Kijun_F"],
+            mode="lines",
+            line=dict(color="#2ECC71", width=1.4),
+            name="Kijun (F%)"
+        ), row=1, col=1)
+    
+    if "Tenkan_F" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["Time"],
+            y=df["Tenkan_F"],
+            mode="lines",
+            line=dict(color="#E63946", width=0.6, dash="solid"),
+            name="Tenkan (F%)"
+        ), row=1, col=1)
+    
+    # RVOL markers
+    if "RVOL_5" in df.columns:
+        mask_extreme = df["RVOL_5"] > 1.8
+        mask_strong = (df["RVOL_5"] >= 1.5) & (df["RVOL_5"] < 1.8)
+        
+        if mask_extreme.any():
+            fig.add_trace(go.Scatter(
+                x=df.loc[mask_extreme, "Time"],
+                y=df.loc[mask_extreme, "F_numeric"] + 3,
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=10, color="red"),
+                name="RVOL > 1.8",
+                hovertemplate="Time: %{x}<br>F%: %{y}<br>Extreme Volume"
+            ), row=1, col=1)
+        
+        if mask_strong.any():
+            fig.add_trace(go.Scatter(
+                x=df.loc[mask_strong, "Time"],
+                y=df.loc[mask_strong, "F_numeric"] + 3,
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=10, color="orange"),
+                name="RVOL 1.5-1.79",
+                hovertemplate="Time: %{x}<br>F%: %{y}<br>Strong Volume"
+            ), row=1, col=1)
+    
+    # Layout
+    fig.update_layout(
+        title=f"{ticker} - F% Analysis",
+        margin=dict(l=30, r=30, t=50, b=30),
+        height=800,
+        showlegend=True,
+        hovermode="x unified"
+    )
+    
+    return fig
+
+
+# =============================================================================
+# STREAMLIT APP
+# =============================================================================
+
+def main():
+    """Main application entry point."""
+    
+    # Page configuration
+    st.set_page_config(
+        page_title="Volmike.com",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    st.title("VOLMIKE.COM - Market Analysis Dashboard")
+    
+    # Sidebar controls
+    st.sidebar.header("Input Options")
+    
+    tickers = st.sidebar.multiselect(
+        "Select Tickers",
+        options=DEFAULT_TICKERS,
+        default=["NVDA"]
+    )
+    
+    start_date = st.sidebar.date_input(
+        "Start Date",
+        value=date(2025, 10, 1)
+    )
+    
+    end_date = st.sidebar.date_input(
+        "End Date",
+        value=date.today()
+    )
+    
+    timeframe = st.sidebar.selectbox(
+        "Select Timeframe",
+        options=TIMEFRAME_OPTIONS,
+        index=1
+    )
+    
+    gap_threshold = st.sidebar.slider(
+        "Gap Threshold (%)",
+        min_value=0.0,
+        max_value=5.0,
+        value=0.5,
+        step=0.1
+    )
+    
+    # Run analysis button
+    if st.sidebar.button("Run Analysis"):
+        
+        if not tickers:
+            st.warning("Please select at least one ticker.")
+            return
+        
+        # Create tabs for each ticker
+        ticker_tabs = st.tabs([f"📊 {t}" for t in tickers])
+        
+        for idx, ticker in enumerate(tickers):
+            with ticker_tabs[idx]:
+                
+                st.subheader(f"Analysis for {ticker}")
+                
+                # Fetch daily data
+                with st.spinner(f"Fetching daily data for {ticker}..."):
+                    prev_close, prev_high, prev_low = fetch_daily_data(
+                        ticker,
+                        start_date
+                    )
+                
+                if prev_close is None:
+                    st.error(f"Could not fetch daily data for {ticker}")
+                    continue
+                
+                # Display previous day stats
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Previous Close", f"${prev_close:.2f}")
+                with col2:
+                    st.metric("Previous High", f"${prev_high:.2f}")
+                with col3:
+                    st.metric("Previous Low", f"${prev_low:.2f}")
+                
+                # Fetch intraday data
+                with st.spinner(f"Fetching intraday data for {ticker}..."):
+                    intraday = fetch_intraday_data(
+                        ticker,
+                        start_date,
+                        end_date,
+                        timeframe
+                    )
+                
+                if intraday is None or intraday.empty:
+                    st.error(f"No intraday data available for {ticker}")
+                    continue
+                
+                # Calculate indicators
+                with st.spinner("Calculating indicators..."):
+                    intraday = calculate_f_percentage(intraday, prev_close)
+                    intraday = calculate_rvol(intraday)
+                    intraday = calculate_bollinger_bands(intraday)
+                    intraday = calculate_ichimoku(intraday, prev_close)
+                
+                # Create visualization
+                fig = create_f_percent_plot(
+                    intraday,
+                    prev_close,
+                    prev_high,
+                    prev_low,
+                    ticker
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Data table
+                with st.expander("📊 View Data Table", expanded=False):
+                    display_cols = [
+                        "Time", "Close", "F_numeric", "F%", "Range",
+                        "Volume", "RVOL_5", "Kijun_F", "Tenkan_F"
+                    ]
+                    available_cols = [c for c in display_cols if c in intraday.columns]
+                    st.dataframe(
+                        intraday[available_cols],
+                        use_container_width=True
+                    )
+                
+                # Download data
+                csv_bytes = to_csv_bytes(intraday)
+                csv_b64 = base64.b64encode(csv_bytes).decode("utf-8")
+                st.markdown(
+                    f'<a href="data:text/csv;base64,{csv_b64}" '
+                    f'download="{ticker}_data.csv">⬇️ Download Data (CSV)</a>',
+                    unsafe_allow_html=True
+                )
+
+
+if __name__ == "__main__":
+    main()
