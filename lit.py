@@ -1,11 +1,13 @@
 """
 VolMike - Financial Market Microstructure Analysis Tool
 
-A production-ready Streamlit application for analyzing intraday price movements
-using Mike (basis points from previous close) and relative volume metrics.
+A production-ready Streamlit application for analyzing intraday movements
+using Mike (basis points from previous close, displacement-style) and RVOL.
 
-Author: Trading Analytics Team
-Version: 2.0.0
+Mike (bps displacement) = ((Close - PrevClose) / PrevClose) * 10,000
+- Prev close baseline is 0 bps
+- +0.10% move => +10 bps
+- -0.10% move => -10 bps
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 
@@ -27,7 +29,6 @@ import yfinance as yf
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 
-# Configure Streamlit page
 st.set_page_config(
     page_title="VolMike - Market Microstructure Analysis",
     page_icon="📈",
@@ -35,19 +36,16 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("volmike")
 
-# Constants
 NY_TZ = "America/New_York"
-RTH_START = time(9, 30)  # Regular Trading Hours start
-RTH_END = time(16, 0)  # Regular Trading Hours end (exclusive)
+RTH_START = time(9, 30)
+RTH_END = time(16, 0)
 
-# Available intervals for intraday data
 INTERVAL_MAP = {
     "2m": "2m",
     "5m": "5m",
@@ -56,10 +54,8 @@ INTERVAL_MAP = {
     "60m": "60m",
 }
 
-# Validation patterns
 TICKER_PATTERN = re.compile(r"^[A-Z0-9.\-]{1,12}$")
 
-# Styling
 MIKE_LINE_COLOR = "dodgerblue"
 MIKE_LINE_WIDTH = 2
 
@@ -68,21 +64,8 @@ MIKE_LINE_WIDTH = 2
 # DATA MODELS
 # -----------------------------------------------------------------------------
 
-
-@dataclass(frozen=True)
-class MarketDataRow:
-    """Represents a single row of processed market data."""
-
-    timestamp_ny: str
-    price: float
-    mike: Optional[float]
-    rvol: Optional[float]
-
-
 @dataclass(frozen=True)
 class AnalysisParams:
-    """Parameters for market analysis."""
-
     ticker: str
     start_date: date
     end_date: date
@@ -90,864 +73,464 @@ class AnalysisParams:
     rvol_window: int = 20
 
 
-@dataclass(frozen=True)
-class AnalysisResult:
-    """Complete analysis result with metadata."""
-
-    params: AnalysisParams
-    data: pd.DataFrame
-    computed_at_utc: str
-    stats: dict[str, Any]
-
-
-# -----------------------------------------------------------------------------
-# VALIDATION & UTILITIES
-# -----------------------------------------------------------------------------
-
-
 class ValidationError(Exception):
-    """Raised when input validation fails."""
-
     pass
 
 
+# -----------------------------------------------------------------------------
+# UTILITIES
+# -----------------------------------------------------------------------------
+
+def get_utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
 def validate_ticker(ticker: str) -> str:
-    """
-    Validate and normalize ticker symbol.
-
-    Args:
-        ticker: Raw ticker input from user
-
-    Returns:
-        Normalized ticker symbol (uppercase, stripped)
-
-    Raises:
-        ValidationError: If ticker format is invalid
-    """
-    normalized = (ticker or "").upper().strip()
-
-    if not normalized:
+    t = (ticker or "").upper().strip()
+    if not t:
         raise ValidationError("Ticker cannot be empty.")
-
-    if not TICKER_PATTERN.match(normalized):
-        raise ValidationError(
-            f"Invalid ticker format: '{ticker}'. "
-            "Use only letters, numbers, dots, and hyphens (no spaces)."
-        )
-
-    return normalized
-
+    if not TICKER_PATTERN.match(t):
+        raise ValidationError("Invalid ticker. Use only letters/numbers/dot/hyphen (no spaces).")
+    return t
 
 def validate_date_range(start: date, end: date) -> None:
-    """
-    Validate date range is logical.
-
-    Args:
-        start: Start date
-        end: End date
-
-    Raises:
-        ValidationError: If date range is invalid
-    """
     if start > end:
         raise ValidationError(f"Start date ({start}) cannot be after end date ({end}).")
-
     if end > date.today():
         raise ValidationError(f"End date ({end}) cannot be in the future.")
 
-    # Warn if range is very large
-    delta = (end - start).days
-    if delta > 365:
-        logger.warning(f"Large date range requested: {delta} days")
+
+def ensure_utc_datetime(s: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(s, errors="coerce")
+    if dt.dt.tz is None:
+        return dt.dt.tz_localize("UTC")
+    return dt.dt.tz_convert("UTC")
 
 
-def safe_float_convert(value: Any) -> Optional[float]:
+def normalize_intraday_yf(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Safely convert value to float, handling NaN/inf.
-
-    Args:
-        value: Value to convert
-
-    Returns:
-        Float value if valid, None otherwise
-    """
-    try:
-        result = float(value)
-        return result if np.isfinite(result) else None
-    except (TypeError, ValueError):
-        return None
-
-
-def get_utc_timestamp() -> str:
-    """Get current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).isoformat()
-
-
-# -----------------------------------------------------------------------------
-# DATA FETCHING
-# -----------------------------------------------------------------------------
-
-
-def ensure_utc_timezone(series: pd.Series) -> pd.Series:
-    """
-    Ensure datetime series is UTC timezone-aware.
-
-    Args:
-        series: Pandas datetime series
-
-    Returns:
-        UTC timezone-aware series
-    """
-    dt_series = pd.to_datetime(series, errors="coerce")
-
-    if dt_series.dt.tz is None:
-        # Naive datetime - localize to UTC
-        return dt_series.dt.tz_localize("UTC")
-    else:
-        # Already timezone-aware - convert to UTC
-        return dt_series.dt.tz_convert("UTC")
-
-
-def normalize_yfinance_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize yfinance output to consistent format.
-
-    Args:
-        df: Raw yfinance DataFrame
-
-    Returns:
-        Normalized DataFrame with columns: time (UTC), Close, Volume
+    Return columns: time(UTC tz-aware), Close(float), Volume(float)
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
-    data = df.copy()
+    out = df.copy()
 
-    # Flatten MultiIndex columns if present
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = [col[0] if isinstance(col, tuple) else col for col in data.columns]
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
 
-    data = data.reset_index()
+    out = out.reset_index()
 
-    # Find time column
     time_col = None
-    for candidate in ("Datetime", "Date", "index"):
-        if candidate in data.columns:
-            time_col = candidate
+    for cand in ("Datetime", "Date", "index"):
+        if cand in out.columns:
+            time_col = cand
             break
-
     if time_col is None:
-        logger.error("No time column found in yfinance data")
+        # yfinance usually puts time in the index; after reset_index it's the first col
+        time_col = out.columns[0]
+
+    out = out.rename(columns={time_col: "time"})
+    out["time"] = ensure_utc_datetime(out["time"])
+    out["Close"] = pd.to_numeric(out.get("Close"), errors="coerce")
+    out["Volume"] = pd.to_numeric(out.get("Volume"), errors="coerce")
+
+    out = out.dropna(subset=["time", "Close"]).sort_values("time").reset_index(drop=True)
+    return out[["time", "Close", "Volume"]]
+
+
+def normalize_daily_yf(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a clean daily lookup with columns: date (python date), close(float)
+    """
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    # Rename and process
-    data = data.rename(columns={time_col: "time"})
-    data["time"] = ensure_utc_timezone(data["time"])
-    data["Close"] = pd.to_numeric(data.get("Close"), errors="coerce")
-    data["Volume"] = pd.to_numeric(data.get("Volume"), errors="coerce")
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
 
-    # Clean and sort
-    data = data.dropna(subset=["time", "Close"]).sort_values("time").reset_index(drop=True)
+    idx = pd.to_datetime(out.index, errors="coerce")
+    out = out.copy()
+    out["date"] = idx.date
+    out["close"] = pd.to_numeric(out.get("Close"), errors="coerce").astype(float)
+    out = out.dropna(subset=["date", "close"]).drop_duplicates(subset=["date"]).sort_values("date")
+    return out[["date", "close"]].reset_index(drop=True)
 
-    return data[["time", "Close", "Volume"]]
+
+def filter_rth(intraday: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds time_ny (tz-aware), then filters to 09:30 <= time < 16:00 ET.
+    """
+    if intraday is None or intraday.empty:
+        return pd.DataFrame()
+
+    d = intraday.copy()
+    d["time_ny"] = d["time"].dt.tz_convert(NY_TZ)
+    tonly = d["time_ny"].dt.time
+    mask = (tonly >= RTH_START) & (tonly < RTH_END)
+    d = d.loc[mask].sort_values("time_ny").reset_index(drop=True)
+    return d
+
+
+def calc_mike_bps(close: pd.Series, prev_close: pd.Series) -> pd.Series:
+    """
+    Displacement-style Mike in basis points (0 at prev close).
+    """
+    close = pd.to_numeric(close, errors="coerce").astype(float)
+    prev_close = pd.to_numeric(prev_close, errors="coerce").astype(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mike = ((close - prev_close) / prev_close) * 10_000.0
+    mike = pd.Series(mike).replace([np.inf, -np.inf], np.nan)
+    return mike
+
+
+def calc_rvol(volume: pd.Series, window: int) -> pd.Series:
+    window = max(1, int(window))
+    minp = max(1, window // 2)
+    v = pd.to_numeric(volume, errors="coerce").astype(float)
+    ma = v.rolling(window=window, min_periods=minp).mean()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = v / ma
+    r = pd.Series(r).replace([np.inf, -np.inf], np.nan)
+    return r
+
+
+# -----------------------------------------------------------------------------
+# FETCHING
+# -----------------------------------------------------------------------------
 
 @st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday(ticker: str, start_d: date, end_d: date, interval: str) -> pd.DataFrame:
+    start_dt = datetime.combine(start_d, datetime.min.time())
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
 
-def fetch_intraday_data(
-    ticker: str,
-    start_date: date,
-    end_date: date,
-    interval: str,
-) -> pd.DataFrame:
-    """
-    Fetch intraday bars from yfinance.
-
-    Args:
-        ticker: Stock symbol
-        start_date: Start date (inclusive)
-        end_date: End date (inclusive)
-        interval: Time interval (e.g., '5m')
-
-    Returns:
-        DataFrame with normalized intraday data
-
-    Raises:
-        Exception: If fetching fails
-    """
-    logger.info(f"Fetching intraday data: {ticker} from {start_date} to {end_date}, interval={interval}")
-
-    start_dt = datetime.combine(start_date, datetime.min.time())
-    end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
-
-    try:
-        raw_data = yf.download(
-            tickers=ticker,
-            start=start_dt,
-            end=end_dt,
-            interval=interval,
-            auto_adjust=False,
-            prepost=False,
-            progress=False,
-            threads=False,
-        )
-
-        normalized = normalize_yfinance_data(raw_data)
-        logger.info(f"Fetched {len(normalized)} intraday bars")
-
-        return normalized
-
-    except Exception as e:
-        logger.error(f"Error fetching intraday data: {e}")
-        raise
+    raw = yf.download(
+        tickers=ticker,
+        start=start_dt,
+        end=end_dt,
+        interval=interval,
+        auto_adjust=False,
+        prepost=False,
+        progress=False,
+        threads=False,
+    )
+    return normalize_intraday_yf(raw)
 
 
-def fetch_daily_data_with_backfill(
-    ticker: str,
-    start_date: date,
-    end_date: date,
-    backfill_days: int = 45,
-) -> pd.DataFrame:
-    """
-    Fetch daily bars with backfill for previous close calculation.
-
-    Args:
-        ticker: Stock symbol
-        start_date: Analysis start date
-        end_date: Analysis end date
-        backfill_days: Days to fetch before start_date
-
-    Returns:
-        DataFrame with daily data
-
-    Raises:
-        Exception: If fetching fails
-    """
-    logger.info(f"Fetching daily data with {backfill_days}-day backfill")
-
-    backfill_start = start_date - timedelta(days=backfill_days)
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_daily_backfill(ticker: str, start_d: date, end_d: date, backfill_days: int = 60) -> pd.DataFrame:
+    backfill_start = start_d - timedelta(days=backfill_days)
     start_dt = datetime.combine(backfill_start, datetime.min.time())
-    end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
 
-    try:
-        raw_data = yf.download(
-            tickers=ticker,
-            start=start_dt,
-            end=end_dt,
-            interval="1d",
-            auto_adjust=False,
-            prepost=False,
-            progress=False,
-            threads=False,
-        )
-
-        if raw_data is None or raw_data.empty:
-            raise ValueError("No daily data returned from yfinance")
-
-        data = raw_data.copy()
-
-        # Flatten MultiIndex columns
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = [col[0] if isinstance(col, tuple) else col for col in data.columns]
-
-        # Clean data
-        data = data.dropna(subset=["Close"]).copy()
-
-        logger.info(f"Fetched {len(data)} daily bars")
-        return data
-
-    except Exception as e:
-        logger.error(f"Error fetching daily data: {e}")
-        raise
+    raw = yf.download(
+        tickers=ticker,
+        start=start_dt,
+        end=end_dt,
+        interval="1d",
+        auto_adjust=False,
+        prepost=False,
+        progress=False,
+        threads=False,
+    )
+    return normalize_daily_yf(raw)
 
 
 # -----------------------------------------------------------------------------
-# DATA PROCESSING
+# PROCESSING
 # -----------------------------------------------------------------------------
 
-
-def build_previous_close_lookup(daily_data: pd.DataFrame) -> tuple[list[date], list[float]]:
+def build_prev_close_map(daily_lookup: pd.DataFrame) -> dict[date, float]:
     """
-    Build lookup tables for previous trading day closes.
-
-    Args:
-        daily_data: Daily OHLCV data
-
-    Returns:
-        Tuple of (trading_dates, close_prices) sorted by date
-
-    Raises:
-        ValueError: If daily data is invalid or insufficient
+    daily_lookup columns: date, close (sorted)
+    returns map: date -> prev_close
     """
-    if daily_data is None or daily_data.empty or "Close" not in daily_data.columns:
-        raise ValueError("Daily data is missing or invalid (required for previous close calculation)")
+    if daily_lookup is None or daily_lookup.empty:
+        raise ValueError("No daily data for previous close calculation.")
 
-    # Parse index as dates
-    index_dates = pd.to_datetime(daily_data.index, errors="coerce")
+    dl = daily_lookup.sort_values("date").reset_index(drop=True)
+    dl["prev_close"] = dl["close"].shift(1)
 
-    if index_dates.isna().all():
-        raise ValueError("Daily data index is not parseable as dates")
-
-    # Create clean lookup DataFrame
-    lookup_df = pd.DataFrame(
-        {
-            "date": index_dates.date,
-            "close": pd.to_numeric(daily_data["Close"], errors="coerce").astype(float),
-        }
-    ).dropna(subset=["date", "close"])
-
-    # Remove duplicates and sort
-    lookup_df = lookup_df.drop_duplicates(subset=["date"]).sort_values("date")
-
-    trading_dates = lookup_df["date"].tolist()
-    close_prices = lookup_df["close"].tolist()
-
-    if len(trading_dates) < 2:
-        raise ValueError(
-            "Insufficient daily history for previous close calculation "
-            f"(got {len(trading_dates)} days, need at least 2)"
-        )
-
-    logger.info(f"Built previous close lookup with {len(trading_dates)} trading days")
-    return trading_dates, close_prices
+    # Keep only rows where we actually have a previous close
+    dl = dl.dropna(subset=["prev_close"])
+    return dict(zip(dl["date"].tolist(), dl["prev_close"].astype(float).tolist()))
 
 
-def get_previous_close(
-    trading_dates: list[date],
-    close_prices: list[float],
-    current_date: date,
-) -> Optional[float]:
-    """
-    Get the previous trading day's close for a given date.
-
-    Args:
-        trading_dates: Sorted list of trading dates
-        close_prices: Corresponding close prices
-        current_date: Date to find previous close for
-
-    Returns:
-        Previous trading day's close, or None if not available
-    """
-    # Binary search for insertion point
-    insertion_idx = int(
-        np.searchsorted(
-            np.array(trading_dates, dtype="O"),
-            current_date,
-            side="left",
-        )
-    )
-
-    # If current_date is exactly a trading date, get previous
-    if insertion_idx < len(trading_dates) and trading_dates[insertion_idx] == current_date:
-        if insertion_idx > 0:
-            return float(close_prices[insertion_idx - 1])
-        return None
-
-    # Otherwise, get the last close before current_date
-    if insertion_idx > 0:
-        return float(close_prices[insertion_idx - 1])
-
-    return None
-
-
-def filter_regular_trading_hours(intraday_data: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filter intraday data to Regular Trading Hours (RTH) in New York time.
-
-    RTH is defined as 09:30 <= time < 16:00 ET.
-
-    Args:
-        intraday_data: Intraday data with UTC 'time' column
-
-    Returns:
-        Filtered DataFrame with only RTH data, with 'time_ny' column added
-    """
-    if intraday_data is None or intraday_data.empty:
-        return pd.DataFrame()
-
-    data = intraday_data.copy()
-
-    # Convert to NY timezone
-    data["time_ny"] = data["time"].dt.tz_convert(NY_TZ)
-
-    # Filter to RTH
-    time_only = data["time_ny"].dt.time
-    rth_mask = (time_only >= RTH_START) & (time_only < RTH_END)
-
-    filtered = data.loc[rth_mask].sort_values("time_ny").reset_index(drop=True)
-
-    logger.info(
-        f"Filtered to RTH: {len(filtered)} bars "
-        f"({len(filtered)/len(data)*100:.1f}% of total)"
-    )
-
-    return filtered
-
-
-def calculate_mike(price: float, previous_close: float) -> Optional[float]:
-    """
-    Calculate Mike: price movement in basis points from previous close.
-
-    Mike = (price / previous_close) * 10,000
-
-    This represents the price as basis points (hundredths of a percent)
-    relative to the previous close.
-
-    Args:
-        price: Current price
-        previous_close: Previous trading day's close
-
-    Returns:
-        Mike value, or None if calculation not possible
-    """
-    if previous_close is None or previous_close <= 0:
-        return None
-
-    if price is None or not np.isfinite(price):
-        return None
-
-    return float((price / previous_close) * 10_000.0)
-
-
-def calculate_relative_volume(volume_series: pd.Series, window: int = 20) -> pd.Series:
-    """
-    Calculate rolling relative volume (RVOL).
-
-    RVOL = current_volume / rolling_average_volume
-
-    Args:
-        volume_series: Series of volume values
-        window: Rolling window size
-
-    Returns:
-        Series of RVOL values
-    """
-    window = max(1, int(window))
-    min_periods = max(1, window // 2)
-
-    # Convert to numeric and compute rolling average
-    vol_numeric = pd.to_numeric(volume_series, errors="coerce").astype(float)
-    rolling_avg = vol_numeric.rolling(window=window, min_periods=min_periods).mean()
-
-    # Calculate RVOL
-    rvol = vol_numeric / rolling_avg
-
-    # Replace inf/-inf with NaN
-    rvol = rvol.replace([np.inf, -np.inf], np.nan)
-
-    return rvol
-
-
-def compute_analysis_table(
-    ticker: str,
-    intraday_rth: pd.DataFrame,
-    daily_data: pd.DataFrame,
-    rvol_window: int = 20,
-) -> pd.DataFrame:
-    """
-    Compute complete analysis table with Mike and RVOL metrics.
-
-    Args:
-        ticker: Stock symbol
-        intraday_rth: RTH-filtered intraday data
-        daily_data: Daily data for previous close calculation
-        rvol_window: Window size for RVOL calculation
-
-    Returns:
-        DataFrame with columns: time, price, mike, rvol
-
-    Raises:
-        ValueError: If computation fails due to data issues
-    """
+def compute_table(params: AnalysisParams, intraday_rth: pd.DataFrame, daily_lookup: pd.DataFrame) -> pd.DataFrame:
     if intraday_rth is None or intraday_rth.empty:
-        raise ValueError(
-            "No RTH intraday data available. "
-            "Try a wider date range or different interval."
-        )
+        raise ValueError("No RTH intraday data. Try different dates/interval.")
 
-    logger.info(f"Computing analysis table for {ticker}")
+    prev_map = build_prev_close_map(daily_lookup)
 
-    # Build previous close lookup
-    trading_dates, close_prices = build_previous_close_lookup(daily_data)
+    d = intraday_rth.copy()
+    d["trading_date"] = d["time_ny"].dt.date
+    d["prev_close"] = d["trading_date"].map(prev_map)
 
-    data = intraday_rth.copy()
+    # Mike (bps displacement)
+    d["mike"] = calc_mike_bps(d["Close"], d["prev_close"])
 
-    # Extract NY trading date
-    data["trading_date"] = data["time_ny"].dt.date
+    # Old compatibility columns
+    d["F_numeric"] = d["mike"]
+    d["F%"] = np.where(d["F_numeric"].notna(), d["F_numeric"].round(0).astype("Int64").astype(str) + "%", "N/A")
 
-    # Get previous close for each trading date
-    data["prev_close"] = data["trading_date"].map(
-        lambda d: get_previous_close(trading_dates, close_prices, d)
-    )
+    # RVOL per day
+    d["rvol"] = d.groupby("trading_date")["Volume"].transform(lambda s: calc_rvol(s, params.rvol_window))
 
-    # Calculate Mike
-    data["mike"] = data.apply(
-        lambda row: calculate_mike(
-            safe_float_convert(row.get("Close")),
-            safe_float_convert(row.get("prev_close")),
-        ),
-        axis=1,
-    )
-
-
-
-    # Calculate RVOL
-    data["rvol"] = data.groupby("trading_date")["Volume"].transform(
-    lambda s: calculate_relative_volume(s, window=rvol_window)
-).astype(float)
-
-    # Create output table
-    output = pd.DataFrame(
+    # Output (keep time as datetime for proper Plotly time axis)
+    out = pd.DataFrame(
         {
-            "time": data["time_ny"].dt.strftime("%Y-%m-%d %H:%M"),
-            "price": pd.to_numeric(data["Close"], errors="coerce").astype(float),
-            "mike": pd.to_numeric(data["mike"], errors="coerce").astype(float),
-            "rvol": pd.to_numeric(data["rvol"], errors="coerce").astype(float),
+            "time": d["time_ny"],  # tz-aware datetime (best for chart)
+            "price": pd.to_numeric(d["Close"], errors="coerce").astype(float),
+            "prev_close": pd.to_numeric(d["prev_close"], errors="coerce").astype(float),
+            "mike": pd.to_numeric(d["mike"], errors="coerce").astype(float),
+            "F_numeric": pd.to_numeric(d["F_numeric"], errors="coerce").astype(float),
+            "F%": d["F%"].astype(str),
+            "rvol": pd.to_numeric(d["rvol"], errors="coerce").astype(float),
         }
     )
 
-    # Clean output
-    output = output.dropna(subset=["time", "price"]).reset_index(drop=True)
-
-    logger.info(f"Computed {len(output)} rows with Mike and RVOL")
-
-    return output
+    out = out.dropna(subset=["time", "price"]).reset_index(drop=True)
+    return out
 
 
-def calculate_statistics(data: pd.DataFrame) -> dict[str, Any]:
-    """
-    Calculate summary statistics for the analysis.
+def calc_stats(df: pd.DataFrame) -> dict[str, Any]:
+    def stat_block(s: pd.Series) -> dict[str, Any]:
+        if s is None or s.isna().all():
+            return {"min": None, "max": None, "mean": None, "std": None}
+        return {
+            "min": float(s.min()),
+            "max": float(s.max()),
+            "mean": float(s.mean()),
+            "std": float(s.std()),
+        }
 
-    Args:
-        data: Analysis data with mike and rvol columns
-
-    Returns:
-        Dictionary of statistics
-    """
-    stats = {
-        "total_rows": len(data),
-        "mike": {
-            "min": float(data["mike"].min()) if not data["mike"].isna().all() else None,
-            "max": float(data["mike"].max()) if not data["mike"].isna().all() else None,
-            "mean": float(data["mike"].mean()) if not data["mike"].isna().all() else None,
-            "std": float(data["mike"].std()) if not data["mike"].isna().all() else None,
-        },
-        "rvol": {
-            "min": float(data["rvol"].min()) if not data["rvol"].isna().all() else None,
-            "max": float(data["rvol"].max()) if not data["rvol"].isna().all() else None,
-            "mean": float(data["rvol"].mean()) if not data["rvol"].isna().all() else None,
-            "std": float(data["rvol"].std()) if not data["rvol"].isna().all() else None,
-        },
+    return {
+        "total_rows": int(len(df)),
+        "missing_prev_close_rows": int(df["prev_close"].isna().sum()) if "prev_close" in df else None,
+        "mike": stat_block(df.get("mike")),
+        "rvol": stat_block(df.get("rvol")),
     }
-
-    return stats
 
 
 # -----------------------------------------------------------------------------
 # VISUALIZATION
 # -----------------------------------------------------------------------------
 
-
-def create_mike_chart(data: pd.DataFrame, ticker: str) -> go.Figure:
-    """
-    Create interactive Mike time series chart using Plotly.
-
-    Args:
-        data: Analysis data with 'time' and 'mike' columns
-        ticker: Stock symbol for chart title
-
-    Returns:
-        Plotly Figure object
-    """
+def create_mike_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
     fig = go.Figure()
 
-    # Add Mike line trace
     fig.add_trace(
         go.Scatter(
-            x=data["time"],
-            y=data["mike"],
+            x=df["time"],
+            y=df["mike"],
             mode="lines",
-            name="Mike",
-            line=dict(
-                color=MIKE_LINE_COLOR,
-                width=MIKE_LINE_WIDTH,
-            ),
-            hovertemplate="<b>%{x}</b><br>Mike: %{y:.2f}<extra></extra>",
+            name="Mike (bps)",
+            line=dict(color=MIKE_LINE_COLOR, width=MIKE_LINE_WIDTH),
+            hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>Mike: %{y:.0f} bps<extra></extra>",
         )
     )
 
-    # Add horizontal line at 10,000 (unchanged from previous close)
+    # Baseline at 0 bps (prev close)
     fig.add_hline(
-        y=10_000,
+        y=0,
         line_dash="dash",
         line_color="gray",
         opacity=0.5,
-        annotation_text="Previous Close",
+        annotation_text="Prev Close (0 bps)",
         annotation_position="right",
     )
 
-    # Update layout
     fig.update_layout(
         title=dict(
-            text=f"{ticker} - Mike (Basis Points from Previous Close)",
-            font=dict(size=20, color="#1f77b4"),
-            
+            text=f"{ticker} — Mike (bps from prev close)",
+            font=dict(size=20),
         ),
         xaxis=dict(
             title="Time (New York)",
-            gridcolor="#e5e5e5",
             showgrid=True,
+            gridcolor="rgba(200,200,200,0.35)",
         ),
         yaxis=dict(
-            title="Mike (basis points)",
-            gridcolor="#e5e5e5",
+            title="Mike (bps)",
             showgrid=True,
+            gridcolor="rgba(200,200,200,0.35)",
         ),
         hovermode="x unified",
-        plot_bgcolor="white",
-        height=500,
-        margin=dict(l=60, r=40, t=80, b=60),
+        # transparent background so it blends with Streamlit theme
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        height=520,
+        margin=dict(l=60, r=30, t=80, b=60),
     )
 
     return fig
 
 
 # -----------------------------------------------------------------------------
-# MAIN APPLICATION
+# APP
 # -----------------------------------------------------------------------------
 
+def main() -> None:
+    st.title("📈 VolMike — Market Microstructure Analysis")
 
-def main():
-    """Main Streamlit application."""
-
-    # Header
-    st.title("📈 VolMike - Market Microstructure Analysis")
     st.markdown(
         """
-        Analyze intraday price movements using **Mike** (basis points from previous close)
-        and **Relative Volume** metrics during Regular Trading Hours (RTH).
+        **Mike** = basis points from the previous close (displacement-style).  
+        **RVOL** = current bar volume / rolling mean volume (per day).
         """
     )
 
-    # Input section
-    st.subheader("Analysis Parameters")
+    with st.sidebar:
+        st.header("Parameters")
 
-    col1, col2, col3 = st.columns(3)
+        ticker_input = st.text_input("Ticker", value="SPY")
+        c1, c2 = st.columns(2)
+        with c1:
+            start_d = st.date_input("Start", value=date.today() - timedelta(days=5))
+        with c2:
+            end_d = st.date_input("End", value=date.today())
 
-    with col1:
-        ticker_input = st.text_input(
-            "Ticker Symbol",
-            value="SPY",
-            help="Enter stock ticker (e.g., SPY, AAPL, TSLA)",
-        )
+        interval_choice = st.selectbox("Interval", list(INTERVAL_MAP.keys()), index=1)
+        rvol_window = st.number_input("RVOL Window (bars)", min_value=5, max_value=200, value=20, step=1)
 
-    with col2:
-        start_date = st.date_input(
-            "Start Date",
-            value=date.today() - timedelta(days=5),
-            help="Analysis start date (inclusive)",
-        )
+        run = st.button("🚀 Run", type="primary", use_container_width=True)
 
-    with col3:
-        end_date = st.date_input(
-            "End Date",
-            value=date.today(),
-            help="Analysis end date (inclusive)",
-        )
+    # Nice default: run on first load as well (optional)
+    if "auto_ran" not in st.session_state:
+        st.session_state.auto_ran = True
+        run = True
 
-    col4, col5 = st.columns([1, 2])
+    if not run:
+        st.info("Adjust parameters in the sidebar, then press **Run**.")
+        return
 
-    with col4:
-        interval_choice = st.selectbox(
-            "Time Interval",
-            options=list(INTERVAL_MAP.keys()),
-            index=1,  # Default to 5m
-            help="Intraday bar interval",
-        )
+    try:
+        ticker = validate_ticker(ticker_input)
+        validate_date_range(start_d, end_d)
+        interval = INTERVAL_MAP[interval_choice]
+        params = AnalysisParams(ticker=ticker, start_date=start_d, end_date=end_d, interval=interval, rvol_window=int(rvol_window))
+    except ValidationError as e:
+        st.error(f"❌ {e}")
+        return
+    except Exception as e:
+        st.error(f"❌ Unexpected validation error: {e}")
+        logger.exception("Validation failed")
+        return
 
-    with col5:
-        st.markdown("**RTH:** 09:30 - 16:00 ET | **RVOL Window:** 20 bars")
+    # yfinance intraday constraints hint
+    if interval in ("2m", "5m") and (params.end_date - params.start_date).days > 59:
+        st.warning("yfinance often limits 2m/5m history. If data is missing, try a smaller date range.")
 
-    # Run button
-    run_analysis = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
-
-    if run_analysis:
+    with st.spinner("📡 Fetching data..."):
         try:
-            # Validate inputs
-            ticker = validate_ticker(ticker_input)
-            validate_date_range(start_date, end_date)
-            interval = INTERVAL_MAP[interval_choice]
-
-            params = AnalysisParams(
-                ticker=ticker,
-                start_date=start_date,
-                end_date=end_date,
-                interval=interval,
-                rvol_window=20,
-            )
-
-        except ValidationError as e:
-            st.error(f"❌ Validation Error: {e}")
-            st.stop()
+            intraday = fetch_intraday(params.ticker, params.start_date, params.end_date, params.interval)
+            daily_lookup = fetch_daily_backfill(params.ticker, params.start_date, params.end_date, backfill_days=90)
         except Exception as e:
-            st.error(f"❌ Unexpected Error: {e}")
-            logger.exception("Validation failed")
-            st.stop()
+            st.error(f"❌ Data fetch failed: {e}")
+            logger.exception("Fetch failed")
+            return
 
-        # Fetch data
-        with st.spinner("📡 Fetching data from yfinance..."):
-            try:
-                intraday_data = fetch_intraday_data(
-                    params.ticker,
-                    params.start_date,
-                    params.end_date,
-                    params.interval,
-                )
-                daily_data = fetch_daily_data_with_backfill(
-                    params.ticker,
-                    params.start_date,
-                    params.end_date,
-                )
-            except Exception as e:
-                st.error(f"❌ Data Fetch Error: {e}")
-                logger.exception("Data fetching failed")
-                st.stop()
+    if intraday.empty:
+        st.error("❌ No intraday bars returned. Try a wider range, different interval, or different ticker.")
+        return
 
-        # Validate fetched data
-        if intraday_data.empty:
-            st.error(
-                "❌ No intraday data returned. "
-                "Try a wider date range or different ticker/interval."
-            )
-            st.stop()
+    if daily_lookup.empty or len(daily_lookup) < 2:
+        st.error("❌ Not enough daily history to compute previous close.")
+        return
 
-        if daily_data.empty:
-            st.error(
-                "❌ No daily data returned (required for previous close calculation). "
-                "Please try again."
-            )
-            st.stop()
+    with st.spinner("⚙️ Processing..."):
+        try:
+            intraday_rth = filter_rth(intraday)
+            if intraday_rth.empty:
+                st.error("❌ No RTH bars found (09:30–16:00 ET).")
+                return
 
-        # Process data
-        with st.spinner("⚙️ Processing data..."):
-            try:
-                intraday_rth = filter_regular_trading_hours(intraday_data)
+            table = compute_table(params, intraday_rth, daily_lookup)
+            stats = calc_stats(table)
+        except Exception as e:
+            st.error(f"❌ Processing failed: {e}")
+            logger.exception("Processing failed")
+            return
 
-                if intraday_rth.empty:
-                    st.error(
-                        "❌ No RTH bars found for the selected date range. "
-                        "Try different dates or interval."
-                    )
-                    st.stop()
+    st.success(f"✅ Done — {len(table)} RTH bars")
 
-                analysis_table = compute_analysis_table(
-                    params.ticker,
-                    intraday_rth,
-                    daily_data,
-                    params.rvol_window,
-                )
+    # Chart
+    st.subheader("📊 Mike Chart (Interactive)")
+    fig = create_mike_chart(table, params.ticker)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "responsive": True})
 
-                stats = calculate_statistics(analysis_table)
+    # Stats
+    st.subheader("📈 Summary")
+    a, b, c = st.columns(3)
+    a.metric("Bars", stats["total_rows"])
+    b.metric("Mike (mean)", f"{stats['mike']['mean']:.1f}" if stats["mike"]["mean"] is not None else "N/A")
+    c.metric("RVOL (mean)", f"{stats['rvol']['mean']:.2f}" if stats["rvol"]["mean"] is not None else "N/A")
 
-            except Exception as e:
-                st.error(f"❌ Processing Error: {e}")
-                logger.exception("Data processing failed")
-                st.stop()
+    if stats.get("missing_prev_close_rows"):
+        st.warning(f"Some rows are missing prev close mapping: {stats['missing_prev_close_rows']}")
 
-        # Display results
-        st.success(f"✅ Analysis complete: {len(analysis_table)} RTH bars processed")
+    # Table
+    st.subheader("📋 Data Table")
+    show = table.copy()
+    show["time"] = show["time"].dt.strftime("%Y-%m-%d %H:%M")
+    show["price"] = show["price"].map(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
+    show["prev_close"] = show["prev_close"].map(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
+    show["mike"] = show["mike"].map(lambda x: f"{x:.0f}" if pd.notna(x) else "N/A")
+    show["rvol"] = show["rvol"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
 
-        # Mike chart
-        st.subheader("📊 Mike Chart")
-        mike_chart = create_mike_chart(analysis_table, params.ticker)
-        st.plotly_chart(mike_chart, use_container_width=True)
+    st.dataframe(
+        show[["time", "price", "prev_close", "mike", "F%", "rvol"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "time": st.column_config.TextColumn("Time (NY)"),
+            "price": st.column_config.TextColumn("Close"),
+            "prev_close": st.column_config.TextColumn("Prev Close"),
+            "mike": st.column_config.TextColumn("Mike (bps)"),
+            "F%": st.column_config.TextColumn("F%"),
+            "rvol": st.column_config.TextColumn("RVOL"),
+        },
+    )
 
-        # Statistics
-        st.subheader("📈 Summary Statistics")
-        col_stat1, col_stat2 = st.columns(2)
+    # Export
+    st.subheader("💾 Export")
+    export_payload = {
+        "metadata": {
+            "ticker": params.ticker,
+            "start_date": str(params.start_date),
+            "end_date": str(params.end_date),
+            "interval": interval_choice,
+            "timezone": NY_TZ,
+            "rvol_window": params.rvol_window,
+            "computed_at_utc": get_utc_timestamp(),
+            "mike_definition": "((Close - PrevClose)/PrevClose) * 10000  (bps displacement)",
+        },
+        "statistics": stats,
+        "data": table.assign(time=table["time"].dt.strftime("%Y-%m-%d %H:%M")).to_dict(orient="records"),
+    }
 
-        with col_stat1:
-            st.metric("Total Bars", stats["total_rows"])
-            if stats["mike"]["mean"] is not None:
-                st.metric(
-                    "Mike Mean",
-                    f"{stats['mike']['mean']:.2f}",
-                    help="Average Mike value across all bars",
-                )
-                st.metric(
-                    "Mike Std Dev",
-                    f"{stats['mike']['std']:.2f}",
-                    help="Standard deviation of Mike",
-                )
+    st.download_button(
+        "📥 Download JSON",
+        data=json.dumps(export_payload, indent=2).encode("utf-8"),
+        file_name=f"{params.ticker}_mike_rvol_{params.start_date}_{params.end_date}_{interval_choice}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
-        with col_stat2:
-            if stats["mike"]["min"] is not None and stats["mike"]["max"] is not None:
-                st.metric("Mike Range", f"{stats['mike']['min']:.2f} - {stats['mike']['max']:.2f}")
-            if stats["rvol"]["mean"] is not None:
-                st.metric(
-                    "RVOL Mean",
-                    f"{stats['rvol']['mean']:.2f}",
-                    help="Average relative volume",
-                )
-
-        # Data table
-        st.subheader("📋 Data Table")
-
-        # Format table for display
-        display_table = analysis_table.copy()
-        display_table["mike"] = display_table["mike"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
-        display_table["rvol"] = display_table["rvol"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/A")
-        display_table["price"] = display_table["price"].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "N/A")
-
-        st.dataframe(
-            display_table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "time": st.column_config.TextColumn("Time (NY)"),
-                "price": st.column_config.TextColumn("Price"),
-                "mike": st.column_config.TextColumn("Mike (bps)"),
-                "rvol": st.column_config.TextColumn("RVOL"),
-            },
-        )
-
-        # Export section
-        st.subheader("💾 Export Data")
-
-        # Create JSON export
-        export_data = {
-            "metadata": {
-                "ticker": params.ticker,
-                "start_date": str(params.start_date),
-                "end_date": str(params.end_date),
-                "interval": interval_choice,
-                "timezone": NY_TZ,
-                "rvol_window": params.rvol_window,
-                "computed_at_utc": get_utc_timestamp(),
-            },
-            "statistics": stats,
-            "data": analysis_table.to_dict(orient="records"),
-        }
-
-        json_bytes = json.dumps(export_data, indent=2).encode("utf-8")
-
-        st.download_button(
-            label="📥 Download JSON",
-            data=json_bytes,
-            file_name=f"{params.ticker}_mike_rvol_{params.start_date}_{params.end_date}_{interval_choice}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        # CSV export
-        csv_bytes = analysis_table.to_csv(index=False).encode("utf-8")
-
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv_bytes,
-            file_name=f"{params.ticker}_mike_rvol_{params.start_date}_{params.end_date}_{interval_choice}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    st.download_button(
+        "📥 Download CSV",
+        data=table.assign(time=table["time"].dt.strftime("%Y-%m-%d %H:%M")).to_csv(index=False).encode("utf-8"),
+        file_name=f"{params.ticker}_mike_rvol_{params.start_date}_{params.end_date}_{interval_choice}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 if __name__ == "__main__":
