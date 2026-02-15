@@ -350,7 +350,7 @@ def compute_value_area(
         )
         df = df[df["TimeIndex"].notna()]
         df["LetterIndex"] = (
-            (df["TimeIndex"].dt.hour * 60 + df["TimeIndex"].dt.minute") // 15
+            (df["TimeIndex"].dt.hour * 60 + df["TimeIndex"].dt.minute) // 15
         ).astype(int)
         df["LetterIndex"] -= df["LetterIndex"].min()
         
