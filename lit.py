@@ -251,6 +251,7 @@ def normalize_yfinance_data(df: pd.DataFrame) -> pd.DataFrame:
 
     return data[["time", "Close", "Volume"]]
 
+@st.cache_data(ttl=300, show_spinner=False)
 
 def fetch_intraday_data(
     ticker: str,
@@ -587,9 +588,13 @@ def compute_analysis_table(
         axis=1,
     )
 
+
+
+
     # Calculate RVOL
-    rvol_series = calculate_relative_volume(data["Volume"], window=rvol_window)
-    data["rvol"] = pd.to_numeric(rvol_series, errors="coerce").astype(float)
+    data["rvol"] = data.groupby("trading_date")["Volume"].transform(
+    lambda s: calculate_relative_volume(s, window=rvol_window)
+).astype(float)
 
     # Create output table
     output = pd.DataFrame(
