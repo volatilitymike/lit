@@ -24,6 +24,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from components.ichimoku_f import add_tenkan_kijun_f
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -142,8 +143,9 @@ def normalize_intraday_yf(df: pd.DataFrame) -> pd.DataFrame:
     out["Volume"] = pd.to_numeric(out.get("Volume"), errors="coerce")
 
     out = out.dropna(subset=["time", "Close"]).sort_values("time").reset_index(drop=True)
-    return out[["time", "Close", "Volume"]]
-
+    out["High"] = pd.to_numeric(out.get("High"), errors="coerce")
+    out["Low"]  = pd.to_numeric(out.get("Low"), errors="coerce")
+    return out[["time", "High", "Low", "Close", "Volume"]]
 
 def normalize_daily_yf(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -275,6 +277,7 @@ def compute_table(params: AnalysisParams, intraday_rth: pd.DataFrame, daily_look
 
     # Mike (bps displacement)
     d["mike"] = calc_mike_bps(d["Close"], d["prev_close"])
+    d = add_tenkan_kijun_f(d)
 
     # Old compatibility columns
     d["F_numeric"] = d["mike"]
