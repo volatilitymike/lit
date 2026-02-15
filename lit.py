@@ -690,8 +690,7 @@ def create_mike_chart(data: pd.DataFrame, ticker: str) -> go.Figure:
         title=dict(
             text=f"{ticker} - Mike (Basis Points from Previous Close)",
             font=dict(size=20, color="#1f77b4"),
-            plot_bgcolor="rgba(0,0,0,0)",   # inside the axes
-    paper_bgcolor="rgba(0,0,0,0)",  # around the axes (the “page”)
+            
         ),
         xaxis=dict(
             title="Time (New York)",
