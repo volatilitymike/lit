@@ -482,10 +482,30 @@ def filter_regular_trading_hours(intraday_data: pd.DataFrame) -> pd.DataFrame:
 
     return filtered
 
+
 def calculate_mike(price: float, previous_close: float) -> Optional[float]:
-    if previous_close is None or previous_close <= 0: return None
-    if price is None or not np.isfinite(price): return None
-    return float(((price - previous_close) / previous_close) * 10_000.0)
+    """
+    Calculate Mike: price movement in basis points from previous close.
+
+    Mike = (price / previous_close) * 10,000
+
+    This represents the price as basis points (hundredths of a percent)
+    relative to the previous close.
+
+    Args:
+        price: Current price
+        previous_close: Previous trading day's close
+
+    Returns:
+        Mike value, or None if calculation not possible
+    """
+    if previous_close is None or previous_close <= 0:
+        return None
+
+    if price is None or not np.isfinite(price):
+        return None
+
+    return float((price / previous_close) * 10_000.0)
 
 
 def calculate_relative_volume(volume_series: pd.Series, window: int = 20) -> pd.Series:
@@ -670,7 +690,6 @@ def create_mike_chart(data: pd.DataFrame, ticker: str) -> go.Figure:
         title=dict(
             text=f"{ticker} - Mike (Basis Points from Previous Close)",
             font=dict(size=20, color="#1f77b4"),
-            
         ),
         xaxis=dict(
             title="Time (New York)",
